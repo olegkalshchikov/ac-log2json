@@ -20,7 +20,7 @@ def parse_ac_log(file_path):
         lines = f.readlines()
 
     global_driver_registry = {}  # name -> details (обновляется каскадно)
-    car_id_to_name = {}          # car_id -> name (актуально на момент чтения)
+    car_id_to_name = {}          # car_id -> name
     
     collecting_pilots = False
     pending_connection = None
@@ -31,28 +31,23 @@ def parse_ac_log(file_path):
         line = line.strip()
 
         # --- ШАГ 1: СБОР И ОБНОВЛЕНИЕ МЕТАДАННЫХ ПИЛОТОВ ---
-        
         if "Opening entry list:" in line:
             collecting_pilots = True
             continue
-        
         if "NextSession" in line:
             collecting_pilots = False
 
-        # Режим А: Статический Entry List (Обновление реестра)
         if collecting_pilots and line.startswith("CAR:"):
             main_match = re.search(r"CAR:\s+\d+\s+(\S+)\s+\((\d+)\)\s+\[.*?\]\s+(.*?)\s+\[\]\s+(\d+)", line)
             if main_match:
                 model, car_id, name, steam_id = main_match.groups()
                 name, car_id = name.strip(), int(car_id)
-                # Каскадное обновление данных пилота
                 global_driver_registry[name] = {
                     "DriverName": name, "DriverGuid": steam_id, "CarId": car_id,
                     "CarModel": model, "BallastKG": 0, "Restrictor": 0
                 }
                 car_id_to_name[car_id] = name
             
-            # Поиск Ballast и Restrictor в ближайших строках после CAR:
             look_ahead = i + 1
             while look_ahead < len(lines) and look_ahead < i + 20:
                 next_line = lines[look_ahead].strip()
@@ -70,7 +65,6 @@ def parse_ac_log(file_path):
                         if n in global_driver_registry: global_driver_registry[n]["Restrictor"] = int(r_match.group(1))
                 look_ahead += 1
 
-        # Режим Б: Динамические подключения (Обновление реестра)
         if "NEW PICKUP CONNECTION" in line:
             pending_connection = {"name": None, "car": None, "guid": None, "car_id": None}
         elif pending_connection:
@@ -86,7 +80,6 @@ def parse_ac_log(file_path):
                 else:
                     pending_connection["name"] = idata[-1]
                 
-                # Если все данные собраны — обновляем глобальный реестр
                 if pending_connection.get("name") and pending_connection.get("car") and \
                    pending_connection.get("guid") and pending_connection.get("car_id"):
                     name = pending_connection["name"]
@@ -103,20 +96,22 @@ def parse_ac_log(file_path):
         if "RACE, WaitTime:" in line:
             race_count += 1
             current_race = {
-                "results": [], "laps": [], "tyres": {}, "sectors": {}, 
-                "driver_last_totals": {}, "events": []
+                "results": [], 
+                "laps": [], 
+                "tyres": {}, 
+                "sectors": {}, 
+                "driver_last_totals": {}, 
+                "events": [],
+                "driver_lap_counter": {} # Хранит кол-во ЗАВЕРШЕННЫХ кругов
             }
 
         if current_race:
-
             # --- ОБРАБОТКА СТОЛКНОВЕНИЙ (COLLISION) ---
             if "COLLISION BETWEEN:" in line:
-                # Регулярка для извлечения всех групп данных
                 coll_match = re.search(
                     r"COLLISION BETWEEN:\s*(.*?)\s*\[\]\s*AND\s*(.*?)\s*\[\]\s*SPEED:\s*([\d.]+)\s*WORLD POS:\s*\[(.*?),?\s*(.*?),?\s*(.*?)\]\s*REL POS:\s*\[(.*?),?\s*(.*?),?\s*(.*?)\]", 
                     line
                 )
-                # print(coll_match.groups())
                 if coll_match:
                     name1, name2, speed_ms, _, _, world, _, _, rel = coll_match.groups()
                     wx, wy, wz = world.split(",")
@@ -124,19 +119,23 @@ def parse_ac_log(file_path):
                     d1 = global_driver_registry.get(name1.strip(), {})
                     d2 = global_driver_registry.get(name2.strip(), {})
 
+                    # Текущий круг = завершенные круги + 1
+                    current_lap_for_p1 = current_race["driver_lap_counter"].get(name1, 0) + 1
+
                     event = {
                         "Type": "COLLISION_WITH_CAR",
+                        "Lap": current_lap_for_p1,
                         "CarId": d1.get("CarId"),
                         "Driver": {
-                            "Name": name1.strip(),
+                            "Name": name1,
                             "Guid": d1.get("DriverGuid")
                         },
                         "OtherCarId": d2.get("CarId"),
                         "OtherDriver": {
-                            "Name": name2.strip(),
+                            "Name": name2,
                             "Guid": d2.get("DriverGuid")
                         },
-                        "ImpactSpeed": round(float(speed_ms) / 3.6, 6), # Деление по ТЗ
+                        "ImpactSpeed": round(float(speed_ms) / 3.6, 6),
                         "WorldPosition": {
                             "X": float(wx), "Y": float(wy), "Z": float(wz)
                         },
@@ -165,6 +164,11 @@ def parse_ac_log(file_path):
             lap_header_match = re.search(r"^LAP\s+(.*?)\s+([\d:]+)$", line)
             if lap_header_match:
                 l_name, _ = lap_header_match.groups()
+                l_name = l_name.strip()
+                
+                # Увеличиваем счетчик завершенных кругов для этого пилота
+                current_race["driver_lap_counter"][l_name] = current_race["driver_lap_counter"].get(l_name, 0) + 1
+
                 total_ms = 0
                 look_ahead = i + 1
                 while look_ahead < len(lines) and look_ahead < i + 50:
@@ -214,8 +218,8 @@ def parse_ac_log(file_path):
                         finished_names.add(name)
                     res_idx += 1
                 
-                # --- КОНТРОЛЬ ВЫШЕДШИХ ПИЛОТОВ (Requirement 3) ---
-                disconnected_stats = {} # name -> {"total": 0, "best": float('inf')}
+                # Контроль вышедших пилотов
+                disconnected_stats = {}
                 for lap in current_race["laps"]:
                     name = lap["DriverName"]
                     if name not in finished_names:
@@ -238,9 +242,9 @@ def parse_ac_log(file_path):
                     output_filename = f"race_{race_count}.json"
                     with open(output_filename, 'w', encoding='utf-8') as jf:
                         json.dump({
-                            "Result": current_race["results"],
+                            "Result": current_race["results"], 
                             "Laps": current_race["laps"],
-                            "Events": current_race["events"],
+                            "Events": current_race["events"]
                         }, jf, indent=4, ensure_ascii=False)
                     print(f"Гонка {race_count} сохранена в {output_filename}")
                 current_race = None
